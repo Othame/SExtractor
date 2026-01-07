@@ -9,7 +9,7 @@ from regions import Regions, EllipseSkyRegion, CircleSkyRegion
 from scipy.spatial import cKDTree
 from typing import Callable, List
 from tqdm import tqdm
-
+from photutils.background import Background2D, MedianBackground
 def convert_to_Ds9SkyReg(row):
     center_sky = SkyCoord(row['ALPHA_J2000'], row['DELTA_J2000'], unit='deg', frame='icrs')
     height = 2.5 * row['A_WORLD'] * 2 * u.deg
@@ -65,6 +65,7 @@ class DetectionMap(pd.DataFrame):
                      mask_path : str,
                      ap_size : float = 2.5,
                      pixel_size : float = 0.04,
+                     drop_masked = True,
                      mask_trans_func : Callable = None):
         # 读取mask fits文件
         with fits.open(mask_path) as hdul:
@@ -86,8 +87,13 @@ class DetectionMap(pd.DataFrame):
         # 取出每个源 aperture 内的 mask 求和（布尔 True 会当 1 计数）
         mask_sum = np.asarray(phot['aperture_sum'], dtype=float)
 
-        # 过滤：aperture 内没有被 mask 到（和为 0）的源
-        masked = self[mask_sum == 0].reset_index(drop=True)
+        if drop_masked:
+            # 过滤：aperture 内没有被 mask 到（和为 0）的源
+            masked = self[mask_sum == 0].reset_index(drop=True)
+        else:
+            # 不过滤，只标记被mask的源
+            masked = self.copy()
+            masked['MASKED'] = (mask_sum != 0)
         return masked
     
     def compute_photometry(self, fits_path : str, 
@@ -96,6 +102,10 @@ class DetectionMap(pd.DataFrame):
                     ap_size : float = 2.5,
                     pixel_size : float = 0.04,
                     max_ABmag : float = 33.0,
+                    drop_faint : bool = True,
+                    bkg_sub : bool = False,
+                    bkg_box_size : int = 32,
+                    bkg_filter_size : int = 3,
                     verbose : bool = False):
         '''
         给定fits_path, 计算每个源的photometry
@@ -108,6 +118,14 @@ class DetectionMap(pd.DataFrame):
         with fits.open(fits_path) as hdul:
             data = hdul[0].data
             wcs = WCS(hdul[0].header)
+
+        if bkg_sub:
+            bkg_estimator = MedianBackground()
+            bkg = Background2D(data,
+                            box_size=(bkg_box_size, bkg_box_size),
+                            filter_size=(bkg_filter_size, bkg_filter_size),
+                            bkg_estimator=bkg_estimator)
+            data = data - bkg.background
 
         # 批量构造天球坐标
         ra  = np.asarray(self['ALPHA_J2000'].values, dtype=float)
@@ -139,10 +157,31 @@ class DetectionMap(pd.DataFrame):
 
         if verbose:
             print(out)
-        # 过滤太暗源
-        out = out[out['ABMAG_APER'] < max_ABmag]
+        if drop_faint:
+            # 过滤太暗源
+            out = out[out['ABMAG_APER'] < max_ABmag]
+        else:
+            # 不过滤，只标记太暗的源
+            out = out.copy()
+            out['FAINT'] = (out['ABMAG_APER'] >= max_ABmag)
         return out
     
+    def filter_marginal_sources(self, 
+                                 margin_size_pixel : float = 10,
+                                 image_size_pixel : tuple = (128, 128),
+                                 drop_marginal = True):
+        '''
+        过滤det_map中的边缘源
+        '''
+        x_image = self["X_IMAGE"] - 1
+        y_image = self["Y_IMAGE"] - 1
+        mask = (x_image < margin_size_pixel) | (x_image > image_size_pixel[1] - margin_size_pixel) | (y_image < margin_size_pixel) | (y_image > image_size_pixel[0] - margin_size_pixel)
+        if drop_marginal:
+            filtered = self[mask].reset_index(drop=True)
+        else:
+            filtered = self.copy()
+            filtered['MARGINAL'] = mask
+        return filtered
     def filter_overlap_sources(self):
         '''
         过滤det_map中的星

@@ -48,11 +48,12 @@ class SExtractor:
             zero_point: float = SUBARU_ZP,
             detect_thres : float = 0.5,
             detect_minarea : int = 15,
-            to_ds9reg : bool = True):
+            to_ds9reg : bool = True,
+            verbose : bool = False):
 
         sub_dirs = self.prepare_work_sub_dirs(work_dir=work_dir)
         self.write_config(config_path=config_path,config_dir=sub_dirs["config"])
-        self.run_sex(fits_path=fits_path, sub_dirs=sub_dirs, zero_point=zero_point, detect_thres=detect_thres, detect_minarea=detect_minarea)
+        self.run_sex(fits_path=fits_path, sub_dirs=sub_dirs, zero_point=zero_point, detect_thres=detect_thres, detect_minarea=detect_minarea, verbose=verbose)
         if to_ds9reg:
             self.convert_cat_to_ds9reg(catalog_dir=sub_dirs["catalog"])
 
@@ -83,7 +84,7 @@ class SExtractor:
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(content)
     
-    def run_sex(self, fits_path: str, sub_dirs : Dict[str, str], zero_point : float, detect_thres : float, detect_minarea : int):
+    def run_sex(self, fits_path: str, sub_dirs : Dict[str, str], zero_point : float, detect_thres : float, detect_minarea : int, verbose : bool):
         '''
         给定一个fits, 运行sex, 生成对应的cat
         sex的工作目录就是config_dir, file_name另外指定, 输出路径由cat_path指定
@@ -104,13 +105,21 @@ class SExtractor:
             "-CHECKIMAGE_NAME", f"{background_path},{bkg_sub_path},{segmentation_path}"
         ]
         
-        subprocess.run(
-            cmd,
-            cwd=sub_dirs["config"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
-        )
+        if not verbose:
+            subprocess.run(
+                cmd,
+                cwd=sub_dirs["config"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True
+            )
+        else:
+            print(" ".join(cmd))
+            subprocess.run(
+                cmd,
+                cwd=sub_dirs["config"],
+                check=True
+            )
     
     def convert_cat_to_ds9reg(self, catalog_dir : str):
         '''
@@ -125,6 +134,60 @@ class SExtractor:
             reg_list.append(region_pix)
         reg = Regions(reg_list)
         reg.write(reg_path, overwrite=True)
+
+class SingleThresholdSExtractor:
+    def __init__(self, 
+                 sex_path : str = r"/usr/local/bin/sex"):
+        self.sex = SExtractor(sex_path=sex_path)
+    
+    def run(self,
+            config_path : str,
+            work_dir : str,
+            fits_path : str,
+            threshold : float,
+            zero_point: float = SUBARU_ZP,
+            minarea : int = 15,
+            verbose : bool = False,
+            ) -> DetectionMap:
+        sub_work_dir = self.run_sex(config_path=config_path, work_dir=work_dir, fits_path=fits_path, threshold=threshold, zero_point=zero_point, minarea=minarea)
+        csv_path = self.convert_cat_to_csv(sub_work_dir, threshold)
+        det_map = pd.read_csv(csv_path).drop(columns=["NUMBER"])
+        return DetectionMap(det_map)
+    
+    def run_sex(self,
+                config_path : str,
+                work_dir : str,
+                fits_path : str,
+                threshold : float,
+                zero_point: float,
+                minarea : int) -> str:
+        '''
+        运行sex, 返回对应的工作目录
+        '''
+        sub_work_dir = os.path.join(work_dir, "work")
+        os.makedirs(sub_work_dir, exist_ok=True)
+        self.sex.run(
+            config_path=config_path,
+            work_dir=sub_work_dir,
+            fits_path=fits_path,
+            zero_point=zero_point,
+            detect_thres=threshold,
+            detect_minarea=minarea,
+            to_ds9reg=False
+        )
+        return sub_work_dir
+
+    def convert_cat_to_csv(self, work_dir : str, threshold : float) -> str:
+        '''
+        将sub_work_dir中的catalog转换为csv文件
+        '''
+        cat_path = os.path.join(work_dir, self.sex.sub_dir_names["catalog"], self.sex.cat_name)
+        csv_path = cat_path.replace(".cat", ".csv")
+        cat = Table.read(cat_path, format="ascii.sextractor")
+        cat["THRES"] = threshold
+        cat.write(csv_path, format="ascii.csv", overwrite=True)
+        return csv_path
+
         
 class MultiThresholdSExtractor:
     def __init__(self, 

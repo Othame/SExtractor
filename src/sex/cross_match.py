@@ -13,6 +13,16 @@ def cross_match(ref_path, ext_path, threshold_arcsec=0.04, verbose=False):
         ext_df = ext_path
     else:
         ext_df = DetectionMap.from_csv(ext_path)
+    
+    if ref_df is None or ext_df is None:
+        raise ValueError(f"ref_df is None ? {ref_df is None} or ext_df is None ? {ext_df is None}")
+    
+    if len(ref_df) == 0:
+        print(f"ref_df is empty, return empty detection maps")
+        return ref_df.iloc[0:0], ext_df.iloc[0:0], ref_df, ext_df
+    if len(ext_df) == 0:
+        print(f"ext_df is empty, return empty detection maps")
+        return ref_df.iloc[0:0], ext_df.iloc[0:0], ref_df, ext_df
 
     ref_coords = SkyCoord(ra=ref_df['ALPHA_J2000'].values * u.deg, dec=ref_df['DELTA_J2000'].values * u.deg, frame='icrs')
     ext_coords = SkyCoord(ra=ext_df['ALPHA_J2000'].values * u.deg, dec=ext_df['DELTA_J2000'].values * u.deg, frame='icrs')
