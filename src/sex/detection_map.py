@@ -10,6 +10,9 @@ from scipy.spatial import cKDTree
 from typing import Callable, List
 from tqdm import tqdm
 from photutils.background import Background2D, MedianBackground
+from astropy.stats import sigma_clipped_stats
+from photutils.aperture import CircularAperture, CircularAnnulus
+
 def convert_to_Ds9SkyReg(row):
     center_sky = SkyCoord(row['ALPHA_J2000'], row['DELTA_J2000'], unit='deg', frame='icrs')
     height = 2.5 * row['A_WORLD'] * 2 * u.deg
@@ -166,6 +169,147 @@ class DetectionMap(pd.DataFrame):
             out['FAINT'] = (out['ABMAG_APER'] >= max_ABmag)
         return out
     
+    def compute_photometry_bkg2d_annulus(
+        self, 
+        fits_path: str,
+        zero_point: float,
+        psf_factor: float = 1.0,
+
+        # aperture / annulus in pixels
+        ap_size: float = 2.5,
+        ann_r_in: float = 6.0,
+        ann_r_out: float = 10.0,
+
+        # Background2D params
+        use_bkg2d: bool = True,
+        bkg_box_size: int = 32,
+        bkg_filter_size: int = 3,
+        bkg_mask_bool: np.ndarray | None = None,   # (H,W) True=masked (可选)
+
+        # speed/robustness
+        method: str = "center",     # "center" 快；"exact" 更精确但慢
+        batch_size: int = 5000,
+        sigma_clip: float = 3.0,    # annulus局部背景的sigma-clip
+        drop_faint: bool = True,
+        max_ABmag: float = 33.0,
+        verbose: bool = False,
+    ):
+        """
+        对 df (含 ALPHA_J2000/DELTA_J2000) 做：
+        1) (可选) Background2D 扣大尺度背景
+        2) 每源 annulus sigma-clipped median 做局部背景
+        3) aperture flux 扣掉局部背景，再除 psf_factor，转 nJy/ABmag
+        """
+
+        if self.empty:
+            if verbose:
+                print("Warning: empty catalog")
+            return self.copy()
+
+        with fits.open(fits_path) as hdul:
+            data = hdul[0].data.astype(np.float32)
+            wcs = WCS(hdul[0].header)
+
+        H, W = data.shape
+
+        # --- 0) WCS -> pixel positions (一次性) ---
+        ra = np.asarray(self["ALPHA_J2000"].values, float)
+        dec = np.asarray(self["DELTA_J2000"].values, float)
+        coords = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+        x, y = wcs.world_to_pixel(coords)  # float arrays
+
+        positions = np.vstack([x, y]).T
+        out = self.copy()
+
+        # --- 2) Background2D（整图一次）---
+        if use_bkg2d:
+            bkg_estimator = MedianBackground()
+            bkg = Background2D(
+                data,
+                box_size=(bkg_box_size, bkg_box_size),
+                filter_size=(bkg_filter_size, bkg_filter_size),
+                bkg_estimator=bkg_estimator,
+                mask=bkg_mask_bool
+            )
+            img = data - bkg.background
+        else:
+            img = data
+
+        # --- 3) 批量 aperture + annulus 测光 ---
+        ap_area = np.pi * (ap_size ** 2)
+        zp_njy = (zero_point * u.ABmag).to(u.nJy).value
+
+        flux_out = np.full(len(out), -np.inf, dtype=float)
+        mag_out = np.full(len(out), -np.inf, dtype=float)
+        ann_success = np.ones(len(out), dtype=np.int8)
+
+        for i0 in range(0, len(out), batch_size):
+            i1 = min(i0 + batch_size, len(out))
+            pos_b = positions[i0:i1]
+
+            aper = CircularAperture(pos_b, r=ap_size)
+            ann = CircularAnnulus(pos_b, r_in=ann_r_in, r_out=ann_r_out)
+
+            # aperture sum
+            tab_ap = aperture_photometry(img, aper, method=method)
+            ap_sum = np.asarray(tab_ap["aperture_sum"], float)
+
+            # annulus 像素样本：逐源做 sigma-clipped median（这里是主要耗时点）
+            # 但 128x128 + batch 化后通常还可以接受；做 purity 初测光够用
+            bkg_med = np.zeros(i1 - i0, dtype=float)
+            ann_success_batch = np.ones(i1 - i0, dtype=np.int8)
+
+            ann_masks = ann.to_mask(method=method)  # list of masks
+
+            for k, m in enumerate(ann_masks):
+                cut = m.cutout(img)  # annulus 的 bounding box cutout
+                if cut is None:
+                    ann_success_batch[k] = 0
+                    continue
+
+                ann_data = m.multiply(img)  # same shape as cutout region (outside annulus -> 0)
+                sel = m.data > 0  # annulus pixels
+                vals = ann_data[sel]
+                vals = vals[np.isfinite(vals)]
+                if vals.size < 20:
+                    ann_success_batch[k] = 0
+                    continue
+
+                # sigma-clipped median as local background
+                _, med, _ = sigma_clipped_stats(vals, sigma=sigma_clip)
+                bkg_med[k] = med
+
+            # local background subtraction
+            flux = ap_sum - bkg_med * ap_area
+
+            # PSF / aperture correction factor
+            flux = flux / float(psf_factor)
+
+            # convert to nJy and AB mag
+            flux_njy = flux * zp_njy
+            ok = np.isfinite(flux_njy) & (flux_njy > 0)
+
+            mag = np.full_like(flux_njy, -np.inf, dtype=float)
+            mag[ok] = (flux_njy[ok] * u.nJy).to(u.ABmag).value
+
+            flux_out[i0:i1] = flux_njy
+            mag_out[i0:i1] = mag
+            ann_success[i0:i1] = ann_success_batch
+
+        # 回填结果给 good_pos对应的index
+        out["NJY_APER"] = flux_out
+        out["ABMAG_APER"] = mag_out
+        out["ANNULUS"] = ann_success == 1
+
+        if drop_faint:
+            out = out[np.isfinite(out["ABMAG_APER"]) & (out["ABMAG_APER"] < max_ABmag)]
+        else:
+            out = out.copy()
+            out['FAINT'] = (out['ABMAG_APER'] >= max_ABmag) | np.isinf(out['ABMAG_APER'])
+        if verbose:
+            print(out)
+
+        return out
     def filter_marginal_sources(self, 
                                  margin_size_pixel : float = 10,
                                  image_size_pixel : tuple = (128, 128),
