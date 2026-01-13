@@ -149,7 +149,7 @@ class SingleThresholdSExtractor:
             minarea : int = 15,
             verbose : bool = False,
             ) -> DetectionMap:
-        sub_work_dir = self.run_sex(config_path=config_path, work_dir=work_dir, fits_path=fits_path, threshold=threshold, zero_point=zero_point, minarea=minarea)
+        sub_work_dir = self.run_sex(config_path=config_path, work_dir=work_dir, fits_path=fits_path, threshold=threshold, zero_point=zero_point, minarea=minarea, verbose=verbose)
         csv_path = self.convert_cat_to_csv(sub_work_dir, threshold)
         det_map = pd.read_csv(csv_path).drop(columns=["NUMBER"])
         return DetectionMap(det_map)
@@ -160,7 +160,8 @@ class SingleThresholdSExtractor:
                 fits_path : str,
                 threshold : float,
                 zero_point: float,
-                minarea : int) -> str:
+                minarea : int,
+                verbose : bool) -> str:
         '''
         运行sex, 返回对应的工作目录
         '''
@@ -173,7 +174,8 @@ class SingleThresholdSExtractor:
             zero_point=zero_point,
             detect_thres=threshold,
             detect_minarea=minarea,
-            to_ds9reg=False
+            to_ds9reg=False,
+            verbose=verbose
         )
         return sub_work_dir
 

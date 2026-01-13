@@ -12,6 +12,7 @@ from tqdm import tqdm
 from photutils.background import Background2D, MedianBackground
 from astropy.stats import sigma_clipped_stats
 from photutils.aperture import CircularAperture, CircularAnnulus
+from tqdm import tqdm
 
 def convert_to_Ds9SkyReg(row):
     center_sky = SkyCoord(row['ALPHA_J2000'], row['DELTA_J2000'], unit='deg', frame='icrs')
@@ -210,6 +211,8 @@ class DetectionMap(pd.DataFrame):
             data = hdul[0].data.astype(np.float32)
             wcs = WCS(hdul[0].header)
 
+        print(data.dtype, np.any(np.isnan(data)), np.any(np.isfinite(data)))
+
         H, W = data.shape
 
         # --- 0) WCS -> pixel positions (一次性) ---
@@ -224,14 +227,29 @@ class DetectionMap(pd.DataFrame):
         # --- 2) Background2D（整图一次）---
         if use_bkg2d:
             bkg_estimator = MedianBackground()
-            bkg = Background2D(
-                data,
-                box_size=(bkg_box_size, bkg_box_size),
-                filter_size=(bkg_filter_size, bkg_filter_size),
-                bkg_estimator=bkg_estimator,
-                mask=bkg_mask_bool
-            )
-            img = data - bkg.background
+            try:
+                bkg = Background2D(
+                    data,
+                    box_size=(bkg_box_size, bkg_box_size),
+                    filter_size=(bkg_filter_size, bkg_filter_size),
+                    bkg_estimator=bkg_estimator,
+                    mask=bkg_mask_bool
+                )
+                img = data - bkg.background
+            except ValueError as e:
+                # 使用未被mask的部分 + sigma_clip估计一个median，然后全图减去这个median
+                mask_valid = np.isfinite(data)
+                if bkg_mask_bool is not None:
+                    mask_valid = mask_valid & (~bkg_mask_bool)
+                vals = data[mask_valid]
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:  
+                    median_value = 0.0
+                    if verbose:
+                        print("Warning: No unmasked values available for background median estimation. Using 0.")
+                else:
+                    _, median_value, _ = sigma_clipped_stats(vals, sigma=sigma_clip)
+                img = data - median_value
         else:
             img = data
 
@@ -243,7 +261,7 @@ class DetectionMap(pd.DataFrame):
         mag_out = np.full(len(out), -np.inf, dtype=float)
         ann_success = np.ones(len(out), dtype=np.int8)
 
-        for i0 in range(0, len(out), batch_size):
+        for i0 in tqdm(range(0, len(out), batch_size), disable=not verbose):
             i1 = min(i0 + batch_size, len(out))
             pos_b = positions[i0:i1]
 
